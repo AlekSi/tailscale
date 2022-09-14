@@ -19,28 +19,35 @@ package envknob
 import (
 	"log"
 	"os"
+	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"tailscale.com/types/opt"
 )
 
 var (
-	mu   sync.Mutex
-	set  = map[string]string{}
-	list []string
+	mu      sync.Mutex
+	set     = map[string]string{}
+	regStr  = map[string]*string{}
+	regBool = map[string]*bool{}
 )
 
 func noteEnv(k, v string) {
-	if v == "" {
-		return
-	}
 	mu.Lock()
 	defer mu.Unlock()
-	if _, ok := set[k]; !ok {
-		list = append(list, k)
+	noteEnvLocked(k, v)
+}
+
+func noteEnvLocked(k, v string) {
+	if v != "" {
+		set[k] = v
+	} else {
+		delete(set, k)
 	}
-	set[k] = v
 }
 
 // logf is logger.Logf, but logger depends on envknob, so for circular
@@ -52,6 +59,12 @@ type logf = func(format string, args ...any)
 func LogCurrent(logf logf) {
 	mu.Lock()
 	defer mu.Unlock()
+
+	list := make([]string, 0, len(set))
+	for k := range set {
+		list = append(list, k)
+	}
+	sort.Strings(list)
 	for _, k := range list {
 		logf("envknob: %s=%q", k, set[k])
 	}
@@ -65,6 +78,53 @@ func String(envVar string) string {
 	v := os.Getenv(envVar)
 	noteEnv(envVar, v)
 	return v
+}
+
+// RegisterString returns a pointer to the value of the named environment
+// variable. If envknob.Setenv is called, the pointed-to-value will be
+// updated.
+func RegisterString(envVar string) *string {
+	mu.Lock()
+	defer mu.Unlock()
+	p, ok := regStr[envVar]
+	if !ok {
+		val := os.Getenv(envVar)
+		if val != "" {
+			noteEnvLocked(envVar, val)
+		}
+		p = &val
+		regStr[envVar] = p
+	}
+	return p
+}
+
+// RegisterBool returns a pointer to the value of the named environment
+// variable. If envknob.Setenv is called, the pointed-to-value will be
+// updated.
+func RegisterBool(envVar string) *bool {
+	mu.Lock()
+	defer mu.Unlock()
+	p, ok := regBool[envVar]
+	if !ok {
+		var b bool
+		p = &b
+		setBoolLocked(p, envVar, os.Getenv(envVar))
+		regBool[envVar] = p
+	}
+	return p
+}
+
+func setBoolLocked(p *bool, envVar, val string) {
+	noteEnvLocked(envVar, val)
+	if val == "" {
+		*p = false
+		return
+	}
+	var err error
+	*p, err = strconv.ParseBool(val)
+	if err != nil {
+		log.Fatalf("invalid boolean environment variable %s value %q", envVar, val)
+	}
 }
 
 // Bool returns the boolean value of the named environment variable.
@@ -81,6 +141,7 @@ func BoolDefaultTrue(envVar string) bool {
 }
 
 func boolOr(envVar string, implicitValue bool) bool {
+	assertNotInInit()
 	val := os.Getenv(envVar)
 	if val == "" {
 		return implicitValue
@@ -98,6 +159,7 @@ func boolOr(envVar string, implicitValue bool) bool {
 // The ok result is whether a value was set.
 // If the value isn't a valid int, it exits the program with a failure.
 func LookupBool(envVar string) (v bool, ok bool) {
+	assertNotInInit()
 	val := os.Getenv(envVar)
 	if val == "" {
 		return false, false
@@ -113,6 +175,7 @@ func LookupBool(envVar string) (v bool, ok bool) {
 // OptBool is like Bool, but returns an opt.Bool, so the caller can
 // distinguish between implicitly and explicitly false.
 func OptBool(envVar string) opt.Bool {
+	assertNotInInit()
 	b, ok := LookupBool(envVar)
 	if !ok {
 		return ""
@@ -126,6 +189,7 @@ func OptBool(envVar string) opt.Bool {
 // The ok result is whether a value was set.
 // If the value isn't a valid int, it exits the program with a failure.
 func LookupInt(envVar string) (v int, ok bool) {
+	assertNotInInit()
 	val := os.Getenv(envVar)
 	if val == "" {
 		return 0, false
@@ -165,4 +229,33 @@ func NoLogsNoSupport() bool {
 // SetNoLogsNoSupport enables no-logs-no-support mode.
 func SetNoLogsNoSupport() {
 	os.Setenv("TS_NO_LOGS_NO_SUPPORT", "true")
+}
+
+var inMain atomic.Bool
+
+// SetInMain is a hint from the caller that the main func has started so we
+// don't need to do any more init-time defensive checks.
+func SetInMain() {
+	inMain.Store(true)
+}
+
+func assertNotInInit() {
+	if inMain.Load() {
+		return
+	}
+	skip := 0
+	for {
+		pc, _, _, ok := runtime.Caller(skip)
+		if !ok {
+			return
+		}
+		fu := runtime.FuncForPC(pc)
+		if fu == nil {
+			return
+		}
+		if strings.HasSuffix(fu.Name(), ".init") {
+			panic("envknob check of called from init function")
+		}
+		skip++
+	}
 }
