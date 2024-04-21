@@ -42,7 +42,7 @@ releases with our [Go fork](https://github.com/tailscale/go/), its use is not
 required.)
 
 ```
-go install tailscale.com/cmd/tailscale{,d}
+go install tailscale.com/cmd/tailscale{,d}@latest
 ```
 
 If you're packaging Tailscale for distribution, use `build_dist.sh`
